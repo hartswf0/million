@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Calm Million — Cantor Circles Edition</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #0b0c0f; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
+  .sr { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+</style>
+</head>
+<body>
+<div class="sr" aria-live="polite" id="ariaCounter"></div>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  // ======== Constants ========
+  const MAX = 1_000_000;              // inclusive
+  const SPAN = MAX + 1;               // wrap length
+  const STORAGE = 'calm-million.cantor.v1';
+
+  const COLORS = {
+    bg: '#0b0c0f',
+    fg: '#e9eef3',
+    dim: 'rgba(233, 238, 243, 0.65)',
+    accent: '#7dd3fc',
+    accent2: '#a7f3d0',
+    glass: 'rgba(255,255,255,0.06)',
+    glassLine: 'rgba(255,255,255,0.08)'
+  };
+
+  // ======== Canvas Setup ========
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  let DPR = Math.min(devicePixelRatio || 1, 2);
+  function resize(){
+    DPR = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(innerWidth * DPR);
+    canvas.height = Math.floor(innerHeight * DPR);
+  }
+  resize();
+  addEventListener('resize', resize);
+
+  const ariaCounter = document.getElementById('ariaCounter');
+
+  // ======== State ========
+  const S = {
+    value: 0,
+    running: true,
+    muted: false,
+    showHUD: false,
+    splash: true,
+    // audio
+    audioOn: true,
+    bpm: 60,
+    // elapsed time accounting only while running
+    elapsedAccMs: 0,
+    lastStartTs: null,
+    // modes: 0=count, 1=cantor rings, 2=inversion grid, 3=pappus chain
+    mode: 0,
+    celebrate: false,
+    celebrateT: 0
+  };
+
+  // Load persisted
+  try {
+    const raw = localStorage.getItem(STORAGE);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (typeof p.value === 'number') S.value = clamp(p.value|0, 0, MAX);
+      if (typeof p.running === 'boolean') S.running = p.running;
+      if (typeof p.muted === 'boolean') S.muted = p.muted;
+      if (typeof p.showHUD === 'boolean') S.showHUD = p.showHUD;
+      if (typeof p.elapsedAccMs === 'number') S.elapsedAccMs = Math.max(0, p.elapsedAccMs);
+      if (typeof p.mode === 'number') S.mode = Math.max(0, Math.min(3, p.mode|0));
+      if (typeof p.audioOn === 'boolean') S.audioOn = p.audioOn;
+      if (typeof p.bpm === 'number') S.bpm = Math.max(20, Math.min(180, p.bpm|0));
+    }
+  } catch(_){}
+
+  // ======== Utils ========
+  function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
+  function pad7(n){ return n.toString().padStart(7,'0'); }
+  function digitCount(n){ return n===0?1:(Math.floor(Math.log10(n))+1); }
+  function easeOutCubic(x){ return 1 - Math.pow(1 - x, 3); }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  function persist(){
+    try{ localStorage.setItem(STORAGE, JSON.stringify({
+      value:S.value, running:S.running, muted:S.muted, showHUD:S.showHUD,
+      elapsedAccMs:S.elapsedAccMs, mode:S.mode, audioOn:S.audioOn, bpm:S.bpm
+    })); } catch(_){}
+  }
+
+  function setRunning(b){
+    if (S.running === b) return;
+    S.running = b;
+    if (S.running) {
+      S.lastStartTs = performance.now();
+      scheduleReflectiveStep(true);
+      scheduleTicks();
+    } else {
+      if (S.lastStartTs!=null){ S.elapsedAccMs += performance.now() - S.lastStartTs; S.lastStartTs=null; }
+      clearReflectiveTimers();
+      cancelTicks();
+    }
+    haptic(S.running?10:6); persist();
+  }
+
+  function toggleMute(){
+    S.muted = !S.muted; if (S.muted){ try{ speechSynthesis.cancel(); }catch(_){}}
+    persist(); haptic(12);
+  }
+
+  function toggleHUD(){ S.showHUD = !S.showHUD; persist(); haptic(8); }
+  function nextMode(){ S.mode = (S.mode+1)%4; haptic(18); persist(); }
+
+  // ======== Number patterns (ternary / Cantor) ========
+  function toBase3(n){ let s=''; do{ s = (n%3)+s; n = Math.floor(n/3); }while(n>0); return s; }
+  function isCantorInteger(n){ // true if base-3 uses only 0 and 2 digits
+    while(n>0){ const d = n%3; if (d===1) return false; n = (n/3)|0; }
+    return true; // 0 qualifies
+  }
+
+  // ======== Speech (reflective pacing) ========
+  const speech = { supported: 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window, voice:null, timer:0 };
+  function pickVoice(){ if(!speech.supported) return; const v=speechSynthesis.getVoices(); speech.voice = v.find(x=>/en(-|_)?/i.test(x.lang))||v[0]||null; }
+  if (speech.supported){ pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
+  function clearReflectiveTimers(){ if (speech.timer){ clearTimeout(speech.timer); speech.timer=0;} if (speech.supported){ try{ speechSynthesis.cancel(); }catch(_){}} }
+  function speechRateForDigits(d){ return clamp(0.9 - 0.06*d, 0.35, 1.0); }
+  function pauseMsForDigits(d){ return 1000 + 500*d; }
+  function emulateSpeakTime(d, rate, cb){ const msPerDigitAt1 = 250; const speakMs = Math.round((msPerDigitAt1 * d) / rate); speech.timer = setTimeout(cb, speakMs); }
+
+  function scheduleReflectiveStep(first=false){
+    if (!S.running) return;
+    const d = digitCount(S.value);
+    const rate = speechRateForDigits(d);
+    const pause = pauseMsForDigits(d);
+    const after = () => { speech.timer = setTimeout(()=>{ if(!S.running) return; nextValue(); scheduleReflectiveStep(); }, pause); };
+    if (speech.supported && !S.muted){
+      try{
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(String(S.value));
+        if (speech.voice) u.voice = speech.voice; u.rate = rate; u.onend = after; u.onerror = after; speechSynthesis.speak(u);
+      }catch(_){ emulateSpeakTime(d, rate, after); }
+    } else { emulateSpeakTime(d, rate, after); }
+  }
+
+  function gentleCelebrateSpeech(){ if (!speech.supported || S.muted) return; try{ const u=new SpeechSynthesisUtterance('One million.'); if(speech.voice) u.voice=speech.voice; u.rate=0.8; speechSynthesis.speak(u);}catch(_){} }
+
+  function nextValue(){ const prev=S.value; S.value=(S.value+1)%SPAN; if (S.value===0 && prev===MAX){ S.celebrate=true; S.celebrateT=0; gentleCelebrateSpeech(); } else if (S.value===MAX){ S.celebrate=true; S.celebrateT=0; gentleCelebrateSpeech(); } ariaCounter.textContent = `Value ${S.value} of ${MAX}`; persist(); }
+
+  function haptic(ms=12){ try{ navigator.vibrate && navigator.vibrate(ms);}catch(_){}}
+
+  // ======== WebAudio (Metronome + Drone) ========
+  let AC=null, master=null, clickGain=null, droneGain=null, clickTimer=0, nextTickT=0, tempoTimer=0;
+  function ensureAudio(){ if (AC) return; try{
+    AC = new (window.AudioContext||window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.7; master.connect(AC.destination);
+    clickGain = AC.createGain(); clickGain.gain.value=0; clickGain.connect(master);
+    droneGain = AC.createGain(); droneGain.gain.value=0.08; droneGain.connect(master);
+
+    // Drone: two detuned sines for calm bed
+    const d1 = AC.createOscillator(); d1.type='sine'; d1.frequency.value=110; d1.detune.value=-3; d1.connect(droneGain); d1.start();
+    const d2 = AC.createOscillator(); d2.type='sine'; d2.frequency.value=220; d2.detune.value=+2; d2.connect(droneGain); d2.start();
+
+    // subtle lowpass to soften
+    const lp = AC.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=1200; master.disconnect(); master.connect(lp); lp.connect(AC.destination);
+  }catch(_){}}
+
+  function scheduleTicks(){ if (!AC || S.muted || !S.audioOn) return; cancelTicks(); const now=AC.currentTime; const beat = 60 / S.bpm; nextTickT = now + 0.05; clickTimer = requestAnimationFrame(tickLoop); }
+  function cancelTicks(){ if (clickTimer){ cancelAnimationFrame(clickTimer); clickTimer=0; } }
+  function makeClick(at){ // simple short noise burst
+    const o = AC.createOscillator(); o.type='triangle'; o.frequency.setValueAtTime(1000, at);
+    o.connect(clickGain); clickGain.gain.setValueAtTime(0.0001, at); clickGain.gain.exponentialRampToValueAtTime(0.4, at+0.005); clickGain.gain.exponentialRampToValueAtTime(0.0001, at+0.08); o.start(at); o.stop(at+0.09);
+  }
+  function tickLoop(){ if (!AC || S.muted || !S.audioOn){ clickTimer=0; return; } const now=AC.currentTime; const beat = 60 / S.bpm; while (nextTickT < now + 0.2){ makeClick(nextTickT); nextTickT += beat; }
+    clickTimer = requestAnimationFrame(tickLoop); }
+
+  // Map number to tempo gently (optional fun): base on digital root
+  function digitalRoot(n){ let s=0; do{ s=0; while(n>0){ s += n%10; n=(n/10)|0; } n=s; }while(s>=10); return s; }
+  function updateTempoFromValue(){ const dr = digitalRoot(S.value||1); S.bpm = clamp(40 + dr*10, 40, 140); persist(); if(AC) scheduleTicks(); }
+
+  // ======== Input (minimal circles: play/pause, mute, HUD/mode) ========
+  const Buttons = { play:{x:0,y:0,r:0}, mute:{x:0,y:0,r:0}, hud:{x:0,y:0,r:0} };
+  function handleTap(x,y){ const hit=b=>{ const dx=x-b.x, dy=y-b.y; return dx*dx+dy*dy <= b.r*b.r; };
+    if (S.splash){ S.splash=false; setRunning(true); ensureAudio(); scheduleTicks(); return; }
+    if (hit(Buttons.play)){ setRunning(!S.running); return; }
+    if (hit(Buttons.mute)){ toggleMute(); return; }
+    if (hit(Buttons.hud)){ // short tap toggles HUD; long-press cycles mode
+      const now = performance.now(); if (handleTap.last && now-handleTap.last < 350){ nextMode(); } else { toggleHUD(); }
+      handleTap.last = now; return; }
+  }
+  canvas.addEventListener('pointerdown', (e)=>{ const r=canvas.getBoundingClientRect(); handleTap((e.clientX-r.left)*DPR,(e.clientY-r.top)*DPR); });
+  addEventListener('keydown', (e)=>{ if(e.key===' '){ e.preventDefault(); setRunning(!S.running);} else if (e.key.toLowerCase()==='m'){ toggleMute(); } else if (e.key.toLowerCase()==='t'){ toggleHUD(); } else if (e.key.toLowerCase()==='n'){ nextMode(); } });
+
+  // ======== Timekeeping ========
+  function getElapsedMsNow(){ if (S.running && S.lastStartTs!=null){ return S.elapsedAccMs + (performance.now()-S.lastStartTs); } return S.elapsedAccMs; }
+  function formatDHMS(ms){ let s = Math.floor(ms/1000); const d=Math.floor(s/86400); s-=d*86400; const h=Math.floor(s/3600); s-=h*3600; const m=Math.floor(s/60); s-=m*60; const two=n=>String(n).padStart(2,'0'); return `${d}d:${two(h)}h:${two(m)}m:${two(s)}s`; }
+
+  // ======== Drawing helpers ========
+  function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function roundRectPath(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function arcStroke(cx,cy,r,a0,a1){ ctx.beginPath(); ctx.arc(cx,cy,r,a0,a1); ctx.stroke(); }
+
+  // tick bump effect
+  let lastRenderValue=S.value, tickStart=performance.now();
+  function pulse(durationMs=380){ if (S.value!==lastRenderValue){ lastRenderValue=S.value; tickStart=performance.now(); updateTempoFromValue(); } const p=clamp((performance.now()-tickStart)/durationMs,0,1); return p; }
+
+  // ======== Geometry modules ========
+  // 1) Cantor Rings (map middle-third removal to annular rings)
+  function drawCantorRings(cx, cy, Rmin, Rmax, depth){
+    ctx.save();
+    ctx.globalCompositeOperation='lighter';
+    const drawBand=(r0,r1,alpha)=>{ const g = ctx.createRadialGradient(cx,cy,r0, cx,cy,r1); g.addColorStop(0, `rgba(125,211,252,${alpha})`); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,r1,0,Math.PI*2); ctx.arc(cx,cy,r0,0,Math.PI*2,true); ctx.closePath(); ctx.fill(); };
+    // recursive remove middle third in radius
+    function rec(a,b,d){ if (d<=0){ drawBand(a,b,0.12); return; } const len=b-a; const a2=a+len/3, b2=b-len/3; // keep [a,a2] and [b2,b]
+      drawBand(a,a2, 0.10+0.03*(depth-d));
+      drawBand(b2,b, 0.10+0.03*(depth-d));
+      rec(a, a2, d-1); rec(b2, b, d-1);
+    }
+    rec(Rmin, Rmax, depth);
+    ctx.restore();
+  }
+
+  // 2) Inversion Grid (approximate: map evenly spaced lines via inversion about unit circle then scale)
+  function invertPoint(x,y, R){ // circle inversion radius R centered at 0
+    const r2 = x*x + y*y; if (r2===0) return {x:1e9, y:0}; const k = (R*R)/r2; return {x:x*k, y:y*k}; }
+  function drawInversionField(cx, cy, R, scale){
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.strokeStyle='rgba(167,243,208,0.85)'; ctx.lineWidth=1*DPR;
+    const L = R*1.2;
+    const step = R/6; // sparse grid
+    // circle of inversion
+    ctx.beginPath(); ctx.arc(0,0,R,0,Math.PI*2); ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.stroke();
+    ctx.strokeStyle='rgba(167,243,208,0.85)';
+    // Draw vertical lines x=c, map their samples
+    for (let c=-L; c<=L; c+=step){ drawInvertedLine(c, -L, c, L, R); }
+    // Draw horizontal lines y=c
+    for (let c=-L; c<=L; c+=step){ drawInvertedLine(-L, c, L, c, R); }
+    ctx.restore();
+  }
+  function drawInvertedLine(x0,y0,x1,y1,R){
+    const samples = 80; ctx.beginPath();
+    for (let i=0;i<=samples;i++){
+      const t=i/samples; const x=lerp(x0,x1,t), y=lerp(y0,y1,t); const p=invertPoint(x,y,R);
+      if (i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  // 3) Pappus chain (in the inverted-on-vertical-lines picture: equal circles stacked)
+  function drawPappusTower(cx,cy, gap, count, radius){
+    ctx.save();
+    ctx.translate(cx,cy);
+    // vertical rails
+    ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.lineWidth=1*DPR;
+    ctx.beginPath(); ctx.moveTo(-gap/2, -radius*2.5); ctx.lineTo(-gap/2, radius*2.5); ctx.moveTo(gap/2, -radius*2.5); ctx.lineTo(gap/2, radius*2.5); ctx.stroke();
+    // circles
+    ctx.strokeStyle='rgba(125,211,252,0.9)'; ctx.fillStyle='rgba(125,211,252,0.08)';
+    for (let i=0;i<count;i++){
+      const y = - (count-1)*radius*1.9/2 + i*radius*1.9; ctx.beginPath(); ctx.arc(0, y, radius, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ======== Render Loop ========
+  let t0 = performance.now();
+  function draw(now){
+    const t=(now-t0)/1000, W=canvas.width, H=canvas.height;
+    ctx.fillStyle=COLORS.bg; ctx.fillRect(0,0,W,H);
+
+    // ambient blobs
+    const g1=ctx.createRadialGradient(W*0.2,H*0.15,10, W*0.2,H*0.15, Math.max(W,H)*0.6);
+    g1.addColorStop(0,'rgba(125,211,252,0.12)'); g1.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.globalCompositeOperation='lighter'; ctx.fillStyle=g1; ctx.save(); ctx.translate(Math.sin(t*0.06)*8*DPR, Math.cos(t*0.05)*6*DPR); ctx.fillRect(0,0,W,H); ctx.restore();
+    const g2=ctx.createRadialGradient(W*0.8,H*0.85,10, W*0.8,H*0.85, Math.max(W,H)*0.7);
+    g2.addColorStop(0,'rgba(167,243,208,0.10)'); g2.addColorStop(1,'rgba(0,0,0,0)'); ctx.fillStyle=g2; ctx.save(); ctx.translate(Math.cos(t*0.045)*10*DPR, Math.sin(t*0.04)*8*DPR); ctx.fillRect(0,0,W,H); ctx.restore(); ctx.globalCompositeOperation='source-over';
+
+    const padding=20*DPR; const cardW=Math.min(W - padding*2, 760*DPR); const cardH=Math.min(H - padding*2, 520*DPR);
+    const cardX=(W-cardW)/2, cardY=(H-cardH)/2; const centerX=W/2, centerY=H/2;
+
+    // Card
+    roundRect(cardX, cardY, cardW, cardH, 24*DPR); ctx.fillStyle=COLORS.glass; ctx.fill(); ctx.strokeStyle=COLORS.glassLine; ctx.lineWidth=1*DPR; ctx.stroke();
+
+    // Progress bar
+    const barY=cardY + cardH*0.16; const barW=cardW * (S.value/MAX); const barH=8*DPR;
+    roundRect(cardX + 16*DPR, barY, cardW - 32*DPR, barH, 999*DPR); ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.fill();
+    roundRect(cardX + 16*DPR, barY, Math.max(0, barW - 32*DPR), barH, 999*DPR); const grad=ctx.createLinearGradient(cardX,barY, cardX+cardW,barY); grad.addColorStop(0,'rgba(125,211,252,0.9)'); grad.addColorStop(1,'rgba(167,243,208,0.9)'); ctx.fillStyle=grad; ctx.fill();
+    ctx.fillStyle=COLORS.dim; ctx.font = `${12*DPR}px system-ui,-apple-system,Segoe UI,Roboto`; ctx.textBaseline='middle'; ctx.fillText('0000000', cardX + 16*DPR, barY - 12*DPR);
+    const mStr='1000000'; ctx.fillText(mStr, cardX + cardW - 16*DPR - ctx.measureText(mStr).width, barY - 12*DPR);
+
+    // Number + halo
+    const numStr=pad7(S.value); const numSize=clamp(Math.floor(Math.min(cardW*0.11, cardH*0.26)), 36*DPR, 120*DPR);
+    const numberY = cardY + cardH*0.46; const haloR = numSize * 1.9 + Math.sin(t*0.9)*3*DPR;
+    const haloGrad=ctx.createRadialGradient(centerX, numberY - numSize*0.15, 0, centerX, numberY - numSize*0.15, haloR);
+    haloGrad.addColorStop(0, isCantorInteger(S.value) ? 'rgba(167,243,208,0.22)' : 'rgba(125,211,252,0.18)'); haloGrad.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=haloGrad; ctx.beginPath(); ctx.arc(centerX, numberY - numSize*0.15, haloR, 0, Math.PI*2); ctx.fill();
+
+    const tickScale = 1 + 0.015 * easeOutCubic(pulse(380));
+    ctx.save(); ctx.translate(centerX, numberY); ctx.scale(tickScale, tickScale); ctx.fillStyle=COLORS.fg; ctx.textAlign='center'; ctx.textBaseline='alphabetic'; ctx.font=`700 ${numSize}px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace`; ctx.fillText(numStr, 0, 0); ctx.restore();
+
+    // Mode label (subtle)
+    ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font=`500 ${12*DPR}px system-ui,-apple-system,Segoe UI,Roboto`; const modeNames=['COUNT','CANTOR RINGS','INVERSION','PAPPUS']; ctx.fillText(modeNames[S.mode], centerX - ctx.measureText(modeNames[S.mode]).width/2, barY + barH + 18*DPR);
+
+    // Geometric panel area
+    const panelY = cardY + cardH*0.54; const panelH = cardY + cardH - panelY - 96*DPR; // leave room for buttons
+    const cx = centerX, cy = panelY + panelH/2;
+
+    // draw depending on mode
+    if (S.mode===1){ // Cantor Rings
+      const baseR = Math.min(cardW, panelH)*0.42; const depth = 1 + (digitCount(S.value)%5);
+      drawCantorRings(cx, cy, baseR*0.18, baseR, depth);
+      // base-3 strip
+      const b3 = toBase3(S.value); ctx.fillStyle=COLORS.dim; ctx.font=`500 ${12*DPR}px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace`; ctx.textAlign='center'; ctx.fillText(`base₃: ${b3}`, cx, cy + baseR + 18*DPR);
+    } else if (S.mode===2){ // Inversion grid
+      const R = Math.min(cardW, panelH)*0.4; drawInversionField(cx, cy, R, 1);
+      ctx.fillStyle=COLORS.dim; ctx.font=`500 ${12*DPR}px system-ui`; ctx.textAlign='center'; ctx.fillText('Circle inversion: lines ↦ circles, circles ↦ lines', cx, cy + R + 18*DPR);
+    } else if (S.mode===3){ // Pappus tower
+      const R = Math.min(cardW, panelH)*0.22; const gap = R*3; const count = 7 + (S.value%4);
+      drawPappusTower(cx, cy, gap, count, R);
+      ctx.fillStyle=COLORS.dim; ctx.font=`500 ${12*DPR}px system-ui`; ctx.textAlign='center'; ctx.fillText('Pappus chain (inverted frame): equal circles between rails', cx, cy + R*2.4 + 18*DPR);
+    } else {
+      // COUNT default: draw a calm orbiting ring with 10 markers (mod patterns)
+      const R = Math.min(cardW, panelH)*0.44; ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=1*DPR; ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.stroke();
+      // 10 markers
+      const mod = S.value % 10; for (let k=0;k<10;k++){ const ang = (k/10)*Math.PI*2 - Math.PI/2; const r=R; const x=cx + Math.cos(ang)*r, y=cy + Math.sin(ang)*r; ctx.beginPath(); ctx.arc(x,y, k===mod? 5*DPR:2.5*DPR, 0, Math.PI*2); ctx.fillStyle = k===mod? 'rgba(167,243,208,0.95)':'rgba(255,255,255,0.35)'; ctx.fill(); }
+      // secondary ring for base-3 parity of digits (cantor-membership pulse)
+      if (isCantorInteger(S.value)){
+        ctx.beginPath(); ctx.arc(cx,cy,R*0.66,0,Math.PI*2); ctx.strokeStyle='rgba(167,243,208,0.85)'; ctx.lineWidth=2*DPR; ctx.stroke();
+      }
+    }
+
+    // HUD (elapsed runtime)
+    if (S.showHUD){ const hud = `${formatDHMS(getElapsedMsNow())}  •  ${S.bpm} BPM`; const pad=10*DPR; const y=cardY + cardH*0.28; const hudSize=18*DPR; ctx.font=`600 ${hudSize}px system-ui,-apple-system,Segoe UI,Roboto`;
+      const w = ctx.measureText(hud).width + pad*2; const x=centerX - w/2; roundRect(x, y - hudSize - 10*DPR, w, hudSize + 18*DPR, 12*DPR); ctx.fillStyle='rgba(0,0,0,0.28)'; ctx.fill(); ctx.fillStyle=COLORS.fg; ctx.textBaseline='alphabetic'; ctx.textAlign='center'; ctx.fillText(hud, centerX, y); }
+
+    // Controls
+    const btnR=34*DPR, gap=18*DPR, cyBtn = cardY + cardH - 24*DPR - btnR;
+    Buttons.play.x = centerX - (btnR*2 + gap); Buttons.play.y = cyBtn; Buttons.play.r = btnR;
+    Buttons.mute.x = centerX; Buttons.mute.y = cyBtn; Buttons.mute.r = btnR;
+    Buttons.hud.x = centerX + (btnR*2 + gap); Buttons.hud.y = cyBtn; Buttons.hud.r = btnR;
+
+    drawButton(Buttons.play, S.running ? 'pause':'play');
+    drawButton(Buttons.mute, S.muted ? 'muted':'sound');
+    drawButton(Buttons.hud, S.showHUD ? 'mode-on':'mode-off');
+
+    // Splash
+    if (S.splash){ drawSplash(W,H,t); }
+
+    // Celebrate
+    if (S.celebrate){ S.celebrateT += 1/60; drawCelebrate(centerX, numberY - numSize*0.3, S.celebrateT); if (S.celebrateT>3.2){ S.celebrate=false; S.celebrateT=0; } }
+
+    requestAnimationFrame(draw);
+  }
+
+  function drawButton(b,type){ ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.fill(); ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1*DPR; ctx.stroke();
+    ctx.save(); ctx.translate(b.x,b.y); ctx.strokeStyle=COLORS.fg; ctx.fillStyle=COLORS.fg; ctx.lineWidth=2*DPR; ctx.lineCap='round'; ctx.lineJoin='round'; const s=10*DPR;
+    if (type==='play'){ ctx.beginPath(); ctx.moveTo(-s*0.6,-s); ctx.lineTo(s,0); ctx.lineTo(-s*0.6,s); ctx.closePath(); ctx.fill(); }
+    else if (type==='pause'){ const w=4*DPR,h=12*DPR,g=6*DPR; roundRectPath(-g-w,-h,w*2,h*2,2*DPR); ctx.fill(); roundRectPath(g-w,-h,w*2,h*2,2*DPR); ctx.fill(); }
+    else if (type==='sound'){ ctx.beginPath(); ctx.moveTo(-10*DPR,-6*DPR); ctx.lineTo(-16*DPR,-6*DPR); ctx.lineTo(-16*DPR,6*DPR); ctx.lineTo(-10*DPR,6*DPR); ctx.lineTo(-2*DPR,12*DPR); ctx.lineTo(-2*DPR,-12*DPR); ctx.closePath(); ctx.fill(); arcStroke(6*DPR,0,6*DPR,-Math.PI/3,Math.PI/3); arcStroke(10*DPR,0,10*DPR,-Math.PI/3,Math.PI/3); }
+    else if (type==='muted'){ ctx.beginPath(); ctx.moveTo(-10*DPR,-6*DPR); ctx.lineTo(-16*DPR,-6*DPR); ctx.lineTo(-16*DPR,6*DPR); ctx.lineTo(-10*DPR,6*DPR); ctx.lineTo(-2*DPR,12*DPR); ctx.lineTo(-2*DPR,-12*DPR); ctx.closePath(); ctx.fill(); ctx.beginPath(); ctx.moveTo(6*DPR,-8*DPR); ctx.lineTo(18*DPR,8*DPR); ctx.moveTo(18*DPR,-8*DPR); ctx.lineTo(6*DPR,8*DPR); ctx.stroke(); }
+    else if (type==='mode-on' || type==='mode-off'){ // clock-ish with slash for off
+      ctx.beginPath(); ctx.arc(0,0,12*DPR,0,Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,-6*DPR); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(6*DPR,0); ctx.stroke(); if (type==='mode-off'){ ctx.beginPath(); ctx.moveTo(-10*DPR,-10*DPR); ctx.lineTo(10*DPR,10*DPR); ctx.stroke(); }
+    }
+    ctx.restore(); }
+
+  function drawSplash(W,H,t){ const g=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.2, W/2,H/2, Math.max(W,H)*0.7); g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,0,0.45)'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    const title='“A journey of a thousand miles\nbegins with a single step.”'; const sub='Tap anywhere to begin  ·  Double‑tap the right button for modes'; const quote='There is a pledge of the big and of the small in the infinite.'; const by='— Dejan Stojanović';
+    ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillStyle=COLORS.fg; const titleSize=clamp(Math.floor(Math.min(W*0.06, 40*DPR)), 18*DPR, 44*DPR); ctx.font=`700 ${titleSize}px system-ui,-apple-system,Segoe UI,Roboto`; ctx.fillText(title, W/2, H*0.40);
+    ctx.globalAlpha = 0.85 + 0.15*Math.sin(t*2); ctx.font=`500 ${14*DPR}px system-ui,-apple-system,Segoe UI,Roboto`; ctx.fillText(sub, W/2, H*0.55); ctx.globalAlpha=1;
+    ctx.font=`500 ${13*DPR}px system-ui,-apple-system,Segoe UI,Roboto`; ctx.fillStyle='rgba(255,255,255,0.75)'; ctx.fillText(quote, W/2, H*0.62); ctx.fillText(by, W/2, H*0.66);
+  }
+
+  function drawCelebrate(cx,cy,tt){ const rings=5; for(let i=0;i<rings;i++){ const p=clamp((tt - i*0.08)/1.6,0,1); if (p<=0||p>=1) continue; const r=(40 + 180*p)*DPR; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.strokeStyle=`rgba(125,211,252,${0.25*(1-p)})`; ctx.lineWidth=(2+2*(1-p))*DPR; ctx.stroke(); } for(let k=0;k<48;k++){ const ang=(k/48)*Math.PI*2 + tt*0.7; const rad=(40 + 160*Math.min(tt/1.4,1))*DPR; const x=cx + Math.cos(ang)*rad; const y=cy + Math.sin(ang)*rad; ctx.fillStyle = k%2 ? 'rgba(167,243,208,0.9)' : 'rgba(125,211,252,0.9)'; ctx.beginPath(); ctx.arc(x,y,2.2*DPR,0,Math.PI*2); ctx.fill(); } }
+
+  // ======== RAF ========
+  function raf(ts){ if (S.running && S.lastStartTs==null) S.lastStartTs=ts; if (!S.running && S.lastStartTs!=null){ S.elapsedAccMs += ts - S.lastStartTs; S.lastStartTs=null; }
+    draw(ts);
+  }
+  requestAnimationFrame(function loop(ts){ raf(ts); requestAnimationFrame(loop); });
+
+  // kick off on resume
+  if (!S.splash && S.running){ S.lastStartTs=performance.now(); scheduleReflectiveStep(true); ensureAudio(); scheduleTicks(); }
+  if (!S.running) S.lastStartTs=null;
+  if (speech.supported && S.running && !S.splash){ try{ speechSynthesis.speak(new SpeechSynthesisUtterance('')); }catch(_){}}
+})();
+</script>
+</body>
+</html>
