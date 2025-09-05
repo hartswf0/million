@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Calm Million — Canvas Edition (with Metronome & Drone)</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #0b0c0f; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
+  .sr { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+</style>
+</head>
+<body>
+<div class="sr" aria-live="polite" id="ariaCounter"></div>
+<canvas id="c"></canvas>
+
+<script>
+(() => {
+  // ======== Constants ========
+  const MAX = 1_000_000;              // inclusive
+  const SPAN = MAX + 1;               // wrap length
+  const STORAGE = 'calm-million.canvas.v2';
+
+  // Ambient palette (dark+calm)
+  const COLORS = {
+    bg: '#0b0c0f',
+    fg: '#e9eef3',
+    dim: 'rgba(233, 238, 243, 0.6)',
+    accent: '#7dd3fc',
+    accent2: '#a7f3d0',
+    glass: 'rgba(255,255,255,0.06)',
+    glassLine: 'rgba(255,255,255,0.08)'
+  };
+
+  // Audio modes (cycled with middle button)
+  const AUDIO_MODES = ['voice','metro','drone','off'];
+
+  // ======== Canvas Setup ========
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  let DPR = Math.min(devicePixelRatio || 1, 2); // clamp for perf
+  function resize() {
+    DPR = Math.min(devicePixelRatio || 1, 2);
+    canvas.width  = Math.floor(innerWidth  * DPR);
+    canvas.height = Math.floor(innerHeight * DPR);
+  }
+  resize();
+  addEventListener('resize', resize);
+
+  // ======== State ========
+  const S = {
+    value: 0,
+    running: true,
+    showHUD: false,
+    // elapsed time accounting only while running:
+    elapsedAccMs: 0,
+    lastStartTs: null,
+    // splash:
+    splash: true,
+    // celebration:
+    celebrate: false,
+    celebrateT: 0,
+    // audio
+    audioModeIndex: 0, // 0 voice, 1 metro, 2 drone, 3 off
+    toast: { text:'', until:0 },
+  };
+
+  // Load persisted
+  try {
+    const raw = localStorage.getItem(STORAGE);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (typeof s.value === 'number') S.value = Math.max(0, Math.min(MAX, Math.floor(s.value)));
+      if (typeof s.running === 'boolean') S.running = s.running;
+      if (typeof s.showHUD === 'boolean') S.showHUD = s.showHUD;
+      if (typeof s.elapsedAccMs === 'number') S.elapsedAccMs = Math.max(0, s.elapsedAccMs);
+      if (typeof s.audioModeIndex === 'number') S.audioModeIndex = Math.max(0, Math.min(AUDIO_MODES.length-1, s.audioModeIndex));
+      if (typeof s.metroBpm === 'number') Audio.metro.bpm = clamp(Math.round(s.metroBpm), 30, 180);
+      if (typeof s.droneFreq === 'number') Audio.drone.freq = clamp(s.droneFreq, 110, 440);
+    }
+  } catch(_) {}
+
+  const ariaCounter = document.getElementById('ariaCounter');
+
+  // ======== Speech (Reflective pacing) ========
+  const speech = {
+    supported: 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window,
+    voice: null,
+    timer: 0
+  };
+  function pickVoice() {
+    if (!speech.supported) return;
+    const voices = speechSynthesis.getVoices();
+    speech.voice = voices.find(v => /en(-|_)?/i.test(v.lang)) || voices[0] || null;
+  }
+  if (speech.supported) {
+    pickVoice();
+    speechSynthesis.addEventListener('voiceschanged', pickVoice);
+  }
+
+  function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
+  function pad7(n){ return n.toString().padStart(7,'0'); }
+  function digitCount(n){ return n === 0 ? 1 : (Math.floor(Math.log10(n)) + 1); }
+  function speechRateForDigits(d){ return clamp(0.9 - 0.06*d, 0.35, 1.0); }
+  function pauseMsForDigits(d){ return 1000 + 500*d; }
+
+  function persist() {
+    try {
+      localStorage.setItem(STORAGE, JSON.stringify({
+        value: S.value,
+        running: S.running,
+        showHUD: S.showHUD,
+        elapsedAccMs: S.elapsedAccMs,
+        audioModeIndex: S.audioModeIndex,
+        metroBpm: Audio.metro.bpm,
+        droneFreq: Audio.drone.freq,
+      }));
+    } catch(_) {}
+  }
+
+  function setRunning(b) {
+    if (S.running === b) return;
+    S.running = b;
+    if (S.running) {
+      S.lastStartTs = performance.now();
+      scheduleReflectiveStep(true);
+      audioApplyMode();
+    } else {
+      if (S.lastStartTs != null) {
+        S.elapsedAccMs += performance.now() - S.lastStartTs;
+        S.lastStartTs = null;
+      }
+      clearReflectiveTimers();
+      audioStopAll();
+    }
+    haptic(S.running ? 10 : 6);
+    persist();
+  }
+
+  function toggleHUD() {
+    S.showHUD = !S.showHUD;
+    toast(S.showHUD ? 'Time shown' : 'Time hidden');
+    haptic(8);
+    persist();
+  }
+
+  function clearReflectiveTimers() {
+    if (speech.timer) { clearTimeout(speech.timer); speech.timer = 0; }
+    if (speech.supported) { try { speechSynthesis.cancel(); } catch(_) {} }
+  }
+
+  function nextValue() {
+    const prev = S.value;
+    S.value = (S.value + 1) % SPAN;
+    if (S.value === 0 && prev === MAX) {
+      S.celebrate = true; S.celebrateT = 0; gentleCelebrateSpeech();
+      audioCelebrate();
+    } else if (S.value === MAX) {
+      S.celebrate = true; S.celebrateT = 0; gentleCelebrateSpeech();
+      audioCelebrate();
+    }
+    ariaCounter.textContent = `Value ${S.value} of ${MAX}`;
+    persist();
+  }
+
+  function gentleCelebrateSpeech(){
+    if (!speech.supported) return;
+    if (currentAudioMode() !== 'voice') return;
+    try {
+      const u = new SpeechSynthesisUtterance('One million.');
+      if (speech.voice) u.voice = speech.voice;
+      u.rate = 0.8;
+      speechSynthesis.speak(u);
+    } catch(_) {}
+  }
+
+  function scheduleReflectiveStep(first=false) {
+    if (!S.running) return;
+    const d = digitCount(S.value);
+    const rate = speechRateForDigits(d);
+    const pause = pauseMsForDigits(d);
+
+    const afterSpeak = () => {
+      speech.timer = setTimeout(() => {
+        if (!S.running) return;
+        nextValue();
+        scheduleReflectiveStep();
+      }, pause);
+    };
+
+    if (currentAudioMode() === 'voice' && speech.supported) {
+      try {
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(String(S.value));
+        if (speech.voice) u.voice = speech.voice;
+        u.rate = rate;
+        u.onend = afterSpeak;
+        u.onerror = afterSpeak;
+        speechSynthesis.speak(u);
+      } catch(_) {
+        emulateSpeakTime(d, rate, afterSpeak);
+      }
+    } else {
+      emulateSpeakTime(d, rate, afterSpeak);
+    }
+  }
+
+  function emulateSpeakTime(d, rate, cb){
+    const msPerDigitAt1 = 250;
+    const speakMs = Math.round((msPerDigitAt1 * d) / rate);
+    speech.timer = setTimeout(cb, speakMs);
+  }
+
+  function haptic(ms=12){ try{ navigator.vibrate && navigator.vibrate(ms); }catch(_){} }
+
+  function toast(text, ms=1400){ S.toast.text = text; S.toast.until = performance.now() + ms; }
+
+  // ======== Input Handling (canvas buttons + gestures) ========
+  // Three circular hit areas: play/pause, audio mode, HUD
+  const Buttons = {
+    play: { x:0, y:0, r:0 },
+    audio: { x:0, y:0, r:0 },
+    hud:  { x:0, y:0, r:0 }
+  };
+
+  function hit(b, x, y){ const dx = x - b.x, dy = y - b.y; return (dx*dx + dy*dy) <= b.r*b.r; }
+  function currentAudioMode(){ return AUDIO_MODES[S.audioModeIndex]; }
+
+  function cycleAudioMode() {
+    S.audioModeIndex = (S.audioModeIndex + 1) % AUDIO_MODES.length;
+    const m = currentAudioMode();
+    toast(m === 'off' ? 'Audio off' : `Audio: ${m}`);
+    audioApplyMode();
+    persist();
+  }
+
+  function handleTap(x, y) {
+    if (S.splash) {
+      S.splash = false;
+      // ensure audio can init on a gesture if user enables an audio mode
+      audioInit();
+      setRunning(true);
+      return true;
+    }
+    if (hit(Buttons.play, x, y)) { setRunning(!S.running); return true; }
+    if (hit(Buttons.audio, x, y)) { cycleAudioMode(); return true; }
+    if (hit(Buttons.hud, x, y))  { toggleHUD(); return true; }
+    return false;
+  }
+
+  // Pointer gestures for minimal controls: adjust BPM (metro) and Freq (drone)
+  const pointer = { active:false, startX:0, startY:0, lastX:0, lastY:0, adjusted:false };
+  canvas.addEventListener('pointerdown', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * DPR, y = (e.clientY - rect.top) * DPR;
+    const consumed = handleTap(x, y);
+    pointer.active = true; pointer.startX = pointer.lastX = x; pointer.startY = pointer.lastY = y; pointer.adjusted = false;
+    // If a button was tapped, we still allow drag to adjust if not on buttons area
+    if (!consumed) audioInit(); // create context on user gesture just in case
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointer.active || S.splash) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * DPR, y = (e.clientY - rect.top) * DPR;
+    const dx = x - pointer.startX; const dy = y - pointer.startY;
+    if (currentAudioMode() === 'metro') {
+      const delta = Math.round(dx / (5*DPR)); // sensitivity
+      const newBpm = clamp(60 + delta, 30, 180);
+      if (newBpm !== Audio.metro.bpm) {
+        Audio.metro.bpm = newBpm; pointer.adjusted = true;
+        toast(`BPM ${Audio.metro.bpm}`);
+        if (S.running) startMetronome(true);
+        persist();
+      }
+    } else if (currentAudioMode() === 'drone') {
+      const delta = Math.round(-dy / (3*DPR)); // up increases
+      const newFreq = clamp(220 + delta, 110, 440);
+      if (newFreq !== Audio.drone.freq) {
+        Audio.drone.freq = newFreq; pointer.adjusted = true;
+        toast(`Drone ${Math.round(Audio.drone.freq)} Hz`);
+        if (Audio.drone.osc) Audio.drone.osc.frequency.setTargetAtTime(Audio.drone.freq, Audio.ctx.currentTime, 0.02);
+        persist();
+      }
+    }
+    pointer.lastX = x; pointer.lastY = y;
+  });
+  addEventListener('pointerup', ()=>{ pointer.active=false; });
+  addEventListener('pointercancel', ()=>{ pointer.active=false; });
+
+  // Keyboard shortcuts
+  addEventListener('keydown', (e) => {
+    if (e.key === ' ') { e.preventDefault(); setRunning(!S.running); }
+    else if (e.key.toLowerCase() === 'm') { cycleAudioMode(); }
+    else if (e.key.toLowerCase() === 't') { toggleHUD(); }
+    else if (currentAudioMode() === 'metro') {
+      if (e.key === 'ArrowLeft') { Audio.metro.bpm = clamp(Audio.metro.bpm-1, 30, 180); toast(`BPM ${Audio.metro.bpm}`); if (S.running) startMetronome(true); persist(); }
+      if (e.key === 'ArrowRight'){ Audio.metro.bpm = clamp(Audio.metro.bpm+1, 30, 180); toast(`BPM ${Audio.metro.bpm}`); if (S.running) startMetronome(true); persist(); }
+    } else if (currentAudioMode() === 'drone') {
+      if (e.key === 'ArrowUp')   { Audio.drone.freq = clamp(Audio.drone.freq+2, 110, 440); toast(`Drone ${Math.round(Audio.drone.freq)} Hz`); if (Audio.drone.osc) Audio.drone.osc.frequency.setTargetAtTime(Audio.drone.freq, Audio.ctx.currentTime, 0.02); persist(); }
+      if (e.key === 'ArrowDown') { Audio.drone.freq = clamp(Audio.drone.freq-2, 110, 440); toast(`Drone ${Math.round(Audio.drone.freq)} Hz`); if (Audio.drone.osc) Audio.drone.osc.frequency.setTargetAtTime(Audio.drone.freq, Audio.ctx.currentTime, 0.02); persist(); }
+    }
+  });
+
+  // ======== Timekeeping (elapsed runtime) ========
+  function getElapsedMsNow(){
+    if (S.running && S.lastStartTs != null) {
+      return S.elapsedAccMs + (performance.now() - S.lastStartTs);
+    }
+    return S.elapsedAccMs;
+  }
+  function formatDHMS(ms){
+    let s = Math.floor(ms/1000);
+    const days = Math.floor(s / 86400);
+    s -= days*86400;
+    const hrs = Math.floor(s / 3600);
+    s -= hrs*3600;
+    const mins = Math.floor(s / 60);
+    s -= mins*60;
+    const sec = s;
+    const two = (n) => String(n).padStart(2,'0');
+    return `${days}d:${two(hrs)}h:${two(mins)}m:${two(sec)}s`;
+  }
+
+  // ======== Rendering ========
+  let t0 = performance.now();
+
+  function draw(now){
+    const t = (now - t0) / 1000;
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // Background (gradient drift)
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // ambient blobs
+    const g1 = ctx.createRadialGradient(W*0.2, H*0.15, 10, W*0.2, H*0.15, Math.max(W, H)*0.6);
+    g1.addColorStop(0, 'rgba(125, 211, 252, 0.10)');
+    g1.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g1;
+    ctx.save();
+    ctx.translate(Math.sin(t*0.06)*8*DPR, Math.cos(t*0.05)*6*DPR);
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+
+    const g2 = ctx.createRadialGradient(W*0.8, H*0.85, 10, W*0.8, H*0.85, Math.max(W, H)*0.7);
+    g2.addColorStop(0, 'rgba(167, 243, 208, 0.10)');
+    g2.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g2;
+    ctx.save();
+    ctx.translate(Math.cos(t*0.045)*10*DPR, Math.sin(t*0.04)*8*DPR);
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+    ctx.globalCompositeOperation = 'source-over';
+
+    // Card (glass)
+    const padding = 20 * DPR;
+    const cardW = Math.min(W - padding*2, 720*DPR);
+    const cardH = Math.min(H - padding*2, 420*DPR);
+    const cardX = (W - cardW)/2;
+    const cardY = (H - cardH)/2;
+
+    roundRect(cardX, cardY, cardW, cardH, 24*DPR);
+    ctx.fillStyle = COLORS.glass;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.glassLine;
+    ctx.lineWidth = 1*DPR;
+    ctx.stroke();
+
+    // Number + halo
+    const numStr = pad7(S.value);
+    const numSize = clamp(Math.floor(Math.min(cardW*0.11, cardH*0.28)), 36*DPR, 120*DPR);
+    const centerX = W/2;
+    const numberY = cardY + cardH*0.48;
+
+    // Halo (breathing)
+    const haloR = numSize * 1.9 + Math.sin(t*0.9)*3*DPR;
+    const haloGrad = ctx.createRadialGradient(centerX, numberY - numSize*0.15, 0, centerX, numberY - numSize*0.15, haloR);
+    haloGrad.addColorStop(0, 'rgba(125, 211, 252, 0.18)');
+    haloGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = haloGrad;
+    ctx.beginPath();
+    ctx.arc(centerX, numberY - numSize*0.15, haloR, 0, Math.PI*2);
+    ctx.fill();
+
+    // Progress line
+    const barY = cardY + cardH*0.18;
+    const barW = cardW * (S.value / MAX);
+    const barH = 8*DPR;
+    roundRect(cardX + 16*DPR, barY, cardW - 32*DPR, barH, 999*DPR);
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fill();
+    roundRect(cardX + 16*DPR, barY, Math.max(0, barW - 32*DPR), barH, 999*DPR);
+    const grad = ctx.createLinearGradient(cardX, barY, cardX+cardW, barY);
+    grad.addColorStop(0, 'rgba(125, 211, 252, 0.9)');
+    grad.addColorStop(1, 'rgba(167, 243, 208, 0.9)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Legends
+    ctx.fillStyle = COLORS.dim;
+    ctx.font = `${12*DPR}px system-ui, -apple-system, Segoe UI, Roboto`;
+    ctx.textBaseline = 'middle';
+    ctx.fillText('0000000', cardX + 16*DPR, barY - 12*DPR);
+    const mStr = '1000000';
+    ctx.fillText(mStr, cardX + cardW - 16*DPR - ctx.measureText(mStr).width, barY - 12*DPR);
+
+    // Number text (gentle tick animation)
+    const tickScale = 1 + 0.015 * easeOutCubic(pulse(380));
+    ctx.save();
+    ctx.translate(centerX, numberY);
+    ctx.scale(tickScale, tickScale);
+    ctx.fillStyle = COLORS.fg;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = `700 ${numSize}px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace`;
+    ctx.fillText(numStr, 0, 0);
+    ctx.restore();
+
+    // Controls (three minimal circles)
+    const btnR = 34*DPR;
+    const gap = 18*DPR;
+    const cy = cardY + cardH - 24*DPR - btnR;
+
+    Buttons.play.x = centerX - (btnR*2 + gap);
+    Buttons.play.y = cy; Buttons.play.r = btnR;
+
+    Buttons.audio.x = centerX;
+    Buttons.audio.y = cy; Buttons.audio.r = btnR;
+
+    Buttons.hud.x  = centerX + (btnR*2 + gap);
+    Buttons.hud.y  = cy; Buttons.hud.r  = btnR;
+
+    drawButton(Buttons.play, S.running ? 'pause' : 'play');
+    const mode = currentAudioMode();
+    const audioIcon = (mode === 'off') ? 'muted' : (mode === 'voice' ? 'sound-voice' : (mode === 'metro' ? 'sound-metro' : 'sound-drone'));
+    drawButton(Buttons.audio, audioIcon);
+    drawButton(Buttons.hud,  S.showHUD ? 'time-on' : 'time-off');
+
+    // HUD (elapsed runtime)
+    if (S.showHUD) {
+      const hudL = formatDHMS(getElapsedMsNow());
+      const hudR = (()=>{
+        const m = currentAudioMode();
+        if (m === 'metro') return `BPM ${Audio.metro.bpm}`;
+        if (m === 'drone') return `${Math.round(Audio.drone.freq)} Hz`;
+        if (m === 'voice') return 'voice';
+        return 'silent';
+      })();
+      const pad = 10*DPR;
+      const y = cardY + cardH*0.28;
+      const hudSize = 18*DPR;
+      ctx.font = `600 ${hudSize}px system-ui, -apple-system, Segoe UI, Roboto`;
+      const hud = `${hudL}  ·  ${hudR}`;
+      const w = ctx.measureText(hud).width + pad*2;
+      const x = centerX - w/2;
+      roundRect(x, y - hudSize - 10*DPR, w, hudSize + 18*DPR, 12*DPR);
+      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+      ctx.fill();
+      ctx.fillStyle = COLORS.fg;
+      ctx.textBaseline = 'alphabetic';
+      ctx.textAlign = 'center';
+      ctx.fillText(hud, centerX, y);
+    }
+
+    // Splash overlay
+    if (S.splash) { drawSplash(W, H, t); }
+
+    // Toast overlay
+    if (S.toast.text && performance.now() < S.toast.until) {
+      const y = cardY + cardH*0.15;
+      const s = 14*DPR;
+      ctx.font = `600 ${s}px system-ui, -apple-system`;
+      const pad = 10*DPR; const w = ctx.measureText(S.toast.text).width + pad*2;
+      const x = centerX - w/2;
+      roundRect(x, y - s - 8*DPR, w, s + 14*DPR, 10*DPR);
+      ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
+      ctx.fillStyle = COLORS.fg; ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+      ctx.fillText(S.toast.text, centerX, y);
+    }
+
+    // Celebration animation when hitting 1,000,000
+    if (S.celebrate) {
+      S.celebrateT += 1/60;
+      drawCelebrate(centerX, numberY - numSize*0.3, S.celebrateT);
+      if (S.celebrateT > 3.2) { S.celebrate = false; S.celebrateT = 0; }
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  // Rounded rect helper
+  function roundRect(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  // Pulse utility for tick animation (returns 0→1 progress on each change)
+  let lastRenderValue = S.value;
+  let tickStart = performance.now();
+  function pulse(durationMs=380) {
+    if (S.value !== lastRenderValue) {
+      lastRenderValue = S.value;
+      tickStart = performance.now();
+    }
+    const p = clamp((performance.now() - tickStart)/durationMs, 0, 1);
+    return p;
+  }
+  function easeOutCubic(x){ return 1 - Math.pow(1 - x, 3); }
+
+  function drawButton(b, type){
+    // base
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1*DPR;
+    ctx.stroke();
+
+    // icon
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.strokeStyle = COLORS.fg;
+    ctx.fillStyle = COLORS.fg;
+    ctx.lineWidth = 2*DPR;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    const s = 10*DPR;
+    if (type === 'play') {
+      ctx.beginPath();
+      ctx.moveTo(-s*0.6, -s);
+      ctx.lineTo(s, 0);
+      ctx.lineTo(-s*0.6, s);
+      ctx.closePath();
+      ctx.fill();
+    } else if (type === 'pause') {
+      const w = 4*DPR, h = 12*DPR, gap = 6*DPR;
+      roundRectPath(-gap - w, -h, w*2, h*2, 2*DPR);
+      ctx.fill();
+      roundRectPath(gap - w, -h, w*2, h*2, 2*DPR);
+      ctx.fill();
+    } else if (type === 'muted') {
+      // speaker with cross
+      // speaker
+      ctx.beginPath();
+      ctx.moveTo(-10*DPR, -6*DPR); ctx.lineTo(-16*DPR, -6*DPR); ctx.lineTo(-16*DPR, 6*DPR);
+      ctx.lineTo(-10*DPR, 6*DPR); ctx.lineTo( -2*DPR, 12*DPR); ctx.lineTo(-2*DPR, -12*DPR);
+      ctx.closePath(); ctx.fill();
+      // cross
+      ctx.beginPath();
+      ctx.moveTo(6*DPR, -8*DPR); ctx.lineTo(18*DPR, 8*DPR);
+      ctx.moveTo(18*DPR, -8*DPR); ctx.lineTo(6*DPR, 8*DPR);
+      ctx.stroke();
+    } else if (type === 'sound-voice') {
+      // speaker + waves
+      ctx.beginPath();
+      ctx.moveTo(-10*DPR, -6*DPR); ctx.lineTo(-16*DPR, -6*DPR); ctx.lineTo(-16*DPR, 6*DPR);
+      ctx.lineTo(-10*DPR, 6*DPR); ctx.lineTo( -2*DPR, 12*DPR); ctx.lineTo(-2*DPR, -12*DPR);
+      ctx.closePath(); ctx.fill();
+      arcStroke(6*DPR, 0, 6*DPR, -Math.PI/3, Math.PI/3);
+      arcStroke(10*DPR, 0, 10*DPR, -Math.PI/3, Math.PI/3);
+    } else if (type === 'sound-metro') {
+      // small metronome icon
+      ctx.beginPath();
+      ctx.moveTo(-8*DPR, 10*DPR); ctx.lineTo(0, -12*DPR); ctx.lineTo(8*DPR, 10*DPR); ctx.closePath();
+      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -12*DPR); ctx.lineTo(0, 6*DPR); ctx.stroke(); // arm
+      ctx.beginPath(); ctx.moveTo(-8*DPR, 10*DPR); ctx.lineTo(8*DPR, 10*DPR); ctx.stroke();
+    } else if (type === 'sound-drone') {
+      // waveform icon
+      ctx.beginPath();
+      const A = 6*DPR; const L = 20*DPR; const step = L/6; let x = -L/2; const y0 = 0;
+      for (let i=0;i<=6;i++){
+        const y = Math.sin((i/6)*Math.PI*2)*A;
+        if (i===0) ctx.moveTo(x, y0+y); else ctx.lineTo(x, y0+y);
+        x += step;
+      }
+      ctx.stroke();
+    } else if (type === 'time-on' || type === 'time-off') {
+      // clock icon
+      ctx.beginPath();
+      ctx.arc(0, 0, 12*DPR, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.beginPath(); // hour hand
+      ctx.moveTo(0, 0); ctx.lineTo(0, -6*DPR); ctx.stroke();
+      ctx.beginPath(); // minute hand
+      ctx.moveTo(0, 0); ctx.lineTo(6*DPR, 0); ctx.stroke();
+      if (type === 'time-off') {
+        ctx.beginPath();
+        ctx.moveTo(-10*DPR, -10*DPR); ctx.lineTo(10*DPR, 10*DPR);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function roundRectPath(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+  function arcStroke(cx, cy, r, a0, a1){
+    ctx.beginPath(); ctx.arc(cx, cy, r, a0, a1); ctx.stroke();
+  }
+
+  function drawSplash(W,H,t){
+    // subtle vignette
+    const g = ctx.createRadialGradient(W/2, H/2, Math.min(W,H)*0.2, W/2, H/2, Math.max(W,H)*0.7);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    const title = '“A journey of a thousand miles\nbegins with a single step.”';
+    const sub   = 'Tap anywhere to begin';
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.fg;
+
+    const titleSize = clamp(Math.floor(Math.min(W*0.06, 40*DPR)), 18*DPR, 44*DPR);
+    ctx.font = `700 ${titleSize}px system-ui, -apple-system, Segoe UI, Roboto`;
+    wrapFillText(title, W/2, H*0.45, titleSize*1.2);
+
+    ctx.globalAlpha = 0.85 + 0.15*Math.sin(t*2);
+    ctx.font = `500 ${14*DPR}px system-ui, -apple-system, Segoe UI, Roboto`;
+    ctx.fillText(sub, W/2, H*0.58);
+    ctx.globalAlpha = 1;
+  }
+
+  function wrapFillText(text, x, y, lh){
+    const lines = text.split('\n');
+    lines.forEach((ln, i)=>{ ctx.fillText(ln, x, y + i*lh - ((lines.length-1)*lh)/2 ); });
+  }
+
+  function drawCelebrate(cx, cy, tt){
+    // gentle rings + confetti dots
+    const rings = 5;
+    for (let i=0; i<rings; i++){
+      const p = clamp((tt - i*0.08)/1.6, 0, 1);
+      if (p <= 0 || p >= 1) continue;
+      const r = (40 + 180*p) * DPR;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI*2);
+      ctx.strokeStyle = `rgba(125, 211, 252, ${0.25*(1-p)})`;
+      ctx.lineWidth = (2 + 2*(1-p)) * DPR;
+      ctx.stroke();
+    }
+    // dots
+    for (let k=0; k<48; k++){
+      const ang = (k/48) * Math.PI*2 + tt*0.7;
+      const rad = (40 + 160*Math.min(tt/1.4, 1)) * DPR;
+      const x = cx + Math.cos(ang)*rad;
+      const y = cy + Math.sin(ang)*rad;
+      ctx.fillStyle = k%2 ? 'rgba(167, 243, 208, 0.9)' : 'rgba(125, 211, 252, 0.9)';
+      ctx.beginPath();
+      ctx.arc(x, y, 2.2*DPR, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // ======== Animation Loop ========
+  function raf(ts){
+    // accumulate elapsed while running
+    if (S.running && S.lastStartTs == null) S.lastStartTs = ts;
+    if (!S.running && S.lastStartTs != null) {
+      S.elapsedAccMs += ts - S.lastStartTs;
+      S.lastStartTs = null;
+    }
+    draw(ts);
+  }
+  requestAnimationFrame(function loop(ts){ raf(ts); requestAnimationFrame(loop); });
+
+  // Start reflective loop if resuming in running state (after splash is dismissed)
+  if (!S.splash && S.running) {
+    S.lastStartTs = performance.now();
+    scheduleReflectiveStep(true);
+    audioApplyMode();
+  }
+
+  // ======== Audio Engine (Web Audio) ========
+  const Audio = {
+    ctx: null, master: null,
+    metro: { bpm: 60, lookahead: 0.12, nextTime: 0, schedId: 0 },
+    drone: { freq: 220, osc: null, gain: null, lfo: null, lfoGain: null },
+  };
+
+  function audioInit(){
+    if (Audio.ctx) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      Audio.ctx = new AC();
+      Audio.master = Audio.ctx.createGain();
+      Audio.master.gain.value = 0.15; // gentle
+      Audio.master.connect(Audio.ctx.destination);
+    } catch(err) {
+      console.warn('Web Audio init failed', err);
+    }
+  }
+
+  function audioStopAll(){ stopMetronome(); stopDrone(); }
+
+  function audioApplyMode(){
+    if (!Audio.ctx) audioInit();
+    stopMetronome(); stopDrone();
+    const m = currentAudioMode();
+    if (!S.running) return;
+    if (m === 'metro') startMetronome(true);
+    if (m === 'drone') startDrone();
+  }
+
+  // Metronome
+  function startMetronome(reset=false){
+    if (!Audio.ctx) return;
+    stopMetronome();
+    const now = Audio.ctx.currentTime;
+    const interval = 60 / clamp(Audio.metro.bpm, 30, 180);
+    Audio.metro.nextTime = (reset ? now + 0.05 : Math.max(now, Audio.metro.nextTime));
+    Audio.metro.schedId = setInterval(scheduleMetronome, 25);
+    scheduleMetronome();
+  }
+  function stopMetronome(){ if (Audio.metro.schedId) { clearInterval(Audio.metro.schedId); Audio.metro.schedId = 0; } }
+  function scheduleMetronome(){
+    if (!Audio.ctx) return;
+    const { ctx, metro } = Audio;
+    const interval = 60 / clamp(metro.bpm, 30, 180);
+    while (metro.nextTime < ctx.currentTime + metro.lookahead) {
+      clickAt(metro.nextTime);
+      metro.nextTime += interval;
+    }
+  }
+  function clickAt(t){
+    const osc = Audio.ctx.createOscillator();
+    const g = Audio.ctx.createGain();
+    osc.type = 'sine'; osc.frequency.setValueAtTime(1000, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.8, t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    osc.connect(g).connect(Audio.master);
+    osc.start(t); osc.stop(t + 0.08);
+  }
+
+  // Drone
+  function startDrone(){
+    if (!Audio.ctx) return;
+    stopDrone();
+    const g = Audio.ctx.createGain(); g.gain.value = 0.06;
+    const osc = Audio.ctx.createOscillator(); osc.type = 'sine'; osc.frequency.value = Audio.drone.freq;
+    // gentle vibrato
+    const lfo = Audio.ctx.createOscillator(); lfo.frequency.value = 0.15;
+    const lfoGain = Audio.ctx.createGain(); lfoGain.gain.value = 4; // Hz depth
+    lfo.connect(lfoGain).connect(osc.frequency);
+    osc.connect(g).connect(Audio.master);
+    lfo.start(); osc.start();
+    Audio.drone.osc = osc; Audio.drone.gain = g; Audio.drone.lfo = lfo; Audio.drone.lfoGain = lfoGain;
+  }
+  function stopDrone(){
+    if (Audio.drone.osc) {
+      const t = Audio.ctx.currentTime;
+      try { Audio.drone.gain.gain.linearRampToValueAtTime(0.0, t + 0.15); } catch(_){ }
+      try { Audio.drone.osc.stop(t + 0.2); Audio.drone.lfo.stop(t + 0.2); } catch(_){}
+    }
+    Audio.drone.osc = null; Audio.drone.gain = null; Audio.drone.lfo = null; Audio.drone.lfoGain = null;
+  }
+
+  function audioCelebrate(){
+    // tiny swell or fifth if drone active
+    if (currentAudioMode() === 'drone' && Audio.drone.osc && Audio.ctx) {
+      const t = Audio.ctx.currentTime;
+      // quick swell
+      try { Audio.drone.gain.gain.cancelScheduledValues(t); Audio.drone.gain.gain.setTargetAtTime(0.12, t, 0.05); } catch(_){ }
+      // shimmer to perfect fifth and back
+      const base = Audio.drone.freq; const fifth = base * 1.5;
+      try {
+        Audio.drone.osc.frequency.setTargetAtTime(fifth, t, 0.2);
+        Audio.drone.osc.frequency.setTargetAtTime(base, t+1.2, 0.4);
+      } catch(_){ }
+      setTimeout(()=>{ try { Audio.drone.gain.gain.setTargetAtTime(0.06, Audio.ctx.currentTime, 0.2); } catch(_){ } }, 1600);
+    }
+  }
+
+  // ======== Start-up ========
+  // Accessibility kickoff note (empty string helps some engines prep TTS)
+  if (speech.supported && !S.splash && currentAudioMode()==='voice' && S.running){
+    try { speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch(_) {}
+  }
+
+  // ======== Reflective Counter Loop ========
+  function startCounterIfNeeded(){
+    if (!S.splash && S.running) { scheduleReflectiveStep(true); }
+  }
+
+  // ======== Helpers ========
+
+  // No-op
+})();
+</script>
+</body>
+</html>
+ 
